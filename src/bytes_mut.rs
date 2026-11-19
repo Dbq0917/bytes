@@ -104,6 +104,16 @@ const KIND_ARC: usize = 0b0;
 const KIND_VEC: usize = 0b1;
 const KIND_MASK: usize = 0b1;
 
+// Flag stored in the `data` pointer of an ARC-backed handle. When set, the
+// handle is an overlapping (copy-on-write) view created by `BytesMut::share`,
+// meaning another handle may view the same bytes. Any mutation through such a
+// handle must first detach it into a private, uniquely owned allocation. This
+// bit is only ever set together with `KIND_ARC`; `Shared` allocations are at
+// least 2-byte aligned (see the alignment assertion above), so the bit is free
+// to use on a raw `*mut Shared` pointer.
+const SHARED_VIEW: usize = 0b10;
+const SHARED_VIEW_MASK: usize = 0b11;
+
 // The max original capacity value. Any `Bytes` allocated with a greater initial
 // capacity will default to this.
 const MAX_ORIGINAL_CAPACITY_WIDTH: usize = 17;
@@ -272,7 +282,9 @@ impl BytesMut {
 
             let ptr = bytes.ptr.as_ptr();
             let len = bytes.len;
-            let data = AtomicPtr::new(bytes.data.cast());
+            // Strip the copy-on-write tag: an immutable `Bytes` never writes,
+            // so it needs a clean pointer to the backing allocation.
+            let data = AtomicPtr::new(bytes.shared_ptr().cast());
             unsafe { Bytes::with_vtable(ptr, len, data, &SHARED_VTABLE) }
         }
     }
@@ -299,6 +311,58 @@ impl BytesMut {
     /// ```
     pub fn zeroed(len: usize) -> BytesMut {
         BytesMut::from_vec(vec![0; len])
+    }
+
+    /// Creates a second, overlapping view over the same bytes as `self`.
+    ///
+    /// Unlike [`split_off`](Self::split_off) and
+    /// [`split_to`](Self::split_to), the returned `BytesMut` covers the exact
+    /// same range as `self`; both handles can read the same data. The data is
+    /// not copied: this is an O(1) operation that shares the underlying
+    /// allocation and only bumps its reference count, so large buffers keep
+    /// full zero-copy read performance.
+    ///
+    /// The views are isolated using copy-on-write. As long as both handles
+    /// only read, they keep pointing at the same memory. The first time either
+    /// handle is mutated, it detaches into a private copy of just its own
+    /// visible bytes; the other handle keeps observing the original data. The
+    /// copy happens at most once per handle and only covers the view's length,
+    /// not the whole allocation.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use bytes::BytesMut;
+    ///
+    /// let mut a = BytesMut::from(&b"hello"[..]);
+    /// let mut b = a.share();
+    ///
+    /// // Both handles see the same memory before any write.
+    /// assert_eq!(&a[..], b"hello");
+    /// assert_eq!(&b[..], b"hello");
+    ///
+    /// a[0] = b'j';
+    ///
+    /// // The write through `a` is not visible through `b`.
+    /// assert_eq!(&a[..], b"jello");
+    /// assert_eq!(&b[..], b"hello");
+    ///
+    /// b[0] = b'y';
+    /// assert_eq!(&a[..], b"jello");
+    /// assert_eq!(&b[..], b"yello");
+    /// ```
+    #[must_use = "consider reading from `self` directly if you do not need a second handle"]
+    pub fn share(&mut self) -> BytesMut {
+        unsafe {
+            // SAFETY: `shallow_clone` promotes the storage to the shared
+            // representation (if needed) and increments the reference count,
+            // returning a bitwise copy of this handle. Both copies are marked
+            // as overlapping views so that writes trigger copy-on-write.
+            let mut other = self.shallow_clone();
+            self.data = ptr_map(self.data.cast(), |addr| addr | SHARED_VIEW).cast();
+            other.data = ptr_map(other.data.cast(), |addr| addr | SHARED_VIEW).cast();
+            other
+        }
     }
 
     /// Splits the bytes into two at the given index.
@@ -629,6 +693,11 @@ impl BytesMut {
     // In separate function to allow the short-circuits in `reserve` and `try_reclaim` to
     // be inline-able. Significantly helps performance. Returns false if it did not succeed.
     fn reserve_inner(&mut self, additional: usize, allocate: bool) -> bool {
+        // An overlapping view produced by `share` must be detached before any
+        // write (including the reclamation/reallocation performed below). A
+        // uniquely owned handle is untouched by this call.
+        self.ensure_unique();
+
         let len = self.len();
         let kind = self.kind();
 
@@ -693,7 +762,7 @@ impl BytesMut {
         }
 
         debug_assert_eq!(kind, KIND_ARC);
-        let shared: *mut Shared = self.data;
+        let shared: *mut Shared = self.shared_ptr();
 
         // Reserving involves abandoning the currently shared buffer and
         // allocating a new vector with the requested capacity.
@@ -1011,6 +1080,10 @@ impl BytesMut {
 
     #[inline]
     fn as_slice_mut(&mut self) -> &mut [u8] {
+        // Indexing a shared view (`buf[i] = x`, `buf.copy_from_slice(..)`,
+        // etc.) writes through `DerefMut`, so detach first to keep the write
+        // invisible to other handles.
+        self.ensure_unique();
         unsafe { slice::from_raw_parts_mut(self.ptr.as_ptr(), self.len) }
     }
 
@@ -1093,9 +1166,14 @@ impl BytesMut {
         if ptr == other.ptr.as_ptr()
             && self.kind() == KIND_ARC
             && other.kind() == KIND_ARC
-            && self.data == other.data
+            && self.shared_ptr() == other.shared_ptr()
         {
-            // Contiguous blocks, just combine directly
+            // Contiguous blocks, just combine directly. The merged handle
+            // stays a shared view if either side was still overlapping, since
+            // another handle may still observe any of the combined bytes.
+            if other.is_shared_view() && !self.is_shared_view() {
+                self.data = ptr_map(self.data.cast(), |addr| addr | SHARED_VIEW).cast();
+            }
             self.len += other.len;
             self.cap += other.cap;
             Ok(())
@@ -1107,6 +1185,82 @@ impl BytesMut {
     #[inline]
     fn kind(&self) -> usize {
         self.data as usize & KIND_MASK
+    }
+
+    /// Returns `true` if this handle is an overlapping copy-on-write view
+    /// created by [`BytesMut::share`] and writes through it still require
+    /// detaching into a private allocation.
+    #[inline]
+    fn is_shared_view(&self) -> bool {
+        self.data as usize & SHARED_VIEW != 0
+    }
+
+    /// The raw pointer to the backing [`Shared`] allocation with all pointer
+    /// tags removed. Only valid when the storage is `KIND_ARC`.
+    #[inline]
+    fn shared_ptr(&self) -> *mut Shared {
+        ptr_map(self.data.cast(), |addr| addr & !SHARED_VIEW_MASK).cast()
+    }
+
+    /// Removes the [`SHARED_VIEW`] tag while keeping the handle in the ARC
+    /// representation.
+    #[inline]
+    fn clear_shared_view(&mut self) {
+        self.data = self.shared_ptr();
+    }
+
+    /// Copy-on-write entry point.
+    ///
+    /// If the handle is an overlapping view produced by [`BytesMut::share`],
+    /// mutations are not allowed to be visible through any other handle, so the
+    /// view is detached into its own private allocation first. If the handle is
+    /// already uniquely owned, this is an O(1) no-op and no bytes are copied.
+    ///
+    /// The copy only covers the bytes visible through this handle (`self.len`),
+    /// never the whole underlying allocation, so large buffers keep their read
+    /// performance and the first write after sharing pays only for the size of
+    /// the view being modified.
+    #[inline]
+    fn ensure_unique(&mut self) {
+        if !self.is_shared_view() {
+            return;
+        }
+        self.detach_shared_view();
+    }
+
+    /// Slow path of [`ensure_unique`] that actually performs the detachment.
+    #[cold]
+    fn detach_shared_view(&mut self) {
+        debug_assert_eq!(self.kind(), KIND_ARC);
+
+        let shared = self.shared_ptr();
+
+        // If every other handle has gone away, the storage is effectively
+        // unique again: drop the tag and keep using the same allocation
+        // without copying anything.
+        if unsafe { (*shared).is_unique() } {
+            self.clear_shared_view();
+            return;
+        }
+
+        // Otherwise make a private copy of just the visible bytes and release
+        // this handle's reference to the shared storage. The private
+        // allocation starts from the view length, but keeps the original
+        // allocation's growth hint so ordinary appends do not immediately
+        // reallocate.
+        let original_capacity_repr = unsafe { (*shared).original_capacity_repr };
+        let original_capacity = original_capacity_from_repr(original_capacity_repr);
+        let cap = cmp::max(self.len, original_capacity);
+
+        let mut v = ManuallyDrop::new(Vec::with_capacity(cmp::max(cap, 1)));
+        v.extend_from_slice(self.as_ref());
+        unsafe { release_shared(shared) };
+
+        let data = (original_capacity_repr << ORIGINAL_CAPACITY_OFFSET) | KIND_VEC;
+        self.data = invalid_ptr(data);
+        self.ptr = vptr(v.as_mut_ptr());
+        self.cap = v.capacity();
+        debug_assert_eq!(self.len, v.len());
     }
 
     unsafe fn promote_to_shared(&mut self, ref_cnt: usize) {
@@ -1156,7 +1310,7 @@ impl BytesMut {
     #[inline]
     unsafe fn shallow_clone(&mut self) -> BytesMut {
         if self.kind() == KIND_ARC {
-            increment_shared(self.data);
+            increment_shared(self.shared_ptr());
             ptr::read(self)
         } else {
             self.promote_to_shared(/*ref_count = */ 2);
@@ -1210,6 +1364,11 @@ impl BytesMut {
     /// ```
     #[inline]
     pub fn spare_capacity_mut(&mut self) -> &mut [MaybeUninit<u8>] {
+        // Every spare-capacity write (extend, resize, chunk_mut, ...) funnels
+        // through here, so a shared view is detached once before handing out a
+        // mutable spare slice.
+        self.ensure_unique();
+
         unsafe {
             let ptr = self.ptr.as_ptr().add(self.len);
             let len = self.cap - self.len;
@@ -1252,7 +1411,7 @@ impl Drop for BytesMut {
                 let _ = rebuild_vec(self.ptr.as_ptr(), self.len, self.cap, off);
             }
         } else if kind == KIND_ARC {
-            unsafe { release_shared(self.data) };
+            unsafe { release_shared(self.shared_ptr()) };
         }
     }
 }
@@ -1364,6 +1523,9 @@ unsafe impl BufMut for BytesMut {
     fn put_u8(&mut self, n: u8) {
         // Same shape as `Vec::push`, avoiding the default's 1-byte `put_slice`.
         self.reserve(1);
+        // `reserve(1)` is a no-op when spare capacity already exists, so it
+        // may not detach a shared view; make sure the direct write is private.
+        self.ensure_unique();
         let len = self.len();
         // SAFETY: `reserve(1)` guarantees `len < capacity`, so `ptr + len` is
         // in bounds; the byte is initialized before `len` is bumped over it.
@@ -1891,7 +2053,7 @@ impl From<BytesMut> for Vec<u8> {
                 rebuild_vec(bytes.ptr.as_ptr(), bytes.len, bytes.cap, off)
             }
         } else {
-            let shared = bytes.data;
+            let shared = bytes.shared_ptr();
 
             if unsafe { (*shared).is_unique() } {
                 let vec = core::mem::take(unsafe { &mut (*shared).vec });
@@ -1934,6 +2096,31 @@ fn invalid_ptr<T>(addr: usize) -> *mut T {
     let ptr = core::ptr::null_mut::<u8>().wrapping_add(addr);
     debug_assert_eq!(ptr as usize, addr);
     ptr.cast::<T>()
+}
+
+// Rewrites a pointer's address while keeping its provenance. The Miri version
+// goes through pointer arithmetic so strict-provenance checks pass; the
+// non-Miri version casts through an integer for better codegen. Mirrors the
+// `ptr_map` helper in `bytes.rs`.
+#[cfg(miri)]
+fn ptr_map<F>(ptr: *mut u8, f: F) -> *mut u8
+where
+    F: FnOnce(usize) -> usize,
+{
+    let old_addr = ptr as usize;
+    let new_addr = f(old_addr);
+    let diff = new_addr.wrapping_sub(old_addr);
+    ptr.wrapping_add(diff)
+}
+
+#[cfg(not(miri))]
+fn ptr_map<F>(ptr: *mut u8, f: F) -> *mut u8
+where
+    F: FnOnce(usize) -> usize,
+{
+    let old_addr = ptr as usize;
+    let new_addr = f(old_addr);
+    new_addr as *mut u8
 }
 
 unsafe fn rebuild_vec(ptr: *mut u8, mut len: usize, mut cap: usize, off: usize) -> Vec<u8> {

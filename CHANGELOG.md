@@ -1,3 +1,12 @@
+# Unreleased
+
+### Added
+- Add `BytesMut::share`, which creates an overlapping view over the same
+  bytes without copying. Shared views are isolated by copy-on-write: the first
+  mutation through a handle detaches only that handle's visible bytes into a
+  private allocation, so other handles keep observing the original data. Reads
+  remain zero-copy and the copy never covers the whole underlying block.
+
 # 1.12.2 (November 17th, 2026)
 
 ### Fixed
