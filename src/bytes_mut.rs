@@ -942,13 +942,20 @@ impl BytesMut {
         unsafe { self.advance_mut(cnt) }
     }
 
-    /// Absorbs a `BytesMut` that was previously split off if they are
-    /// contiguous, otherwise appends its bytes to this `BytesMut`.
+    /// Absorbs a `BytesMut` that was previously split off if the two views
+    /// can be merged without copying, otherwise appends its bytes to this
+    /// `BytesMut`.
     ///
     /// If the two `BytesMut` objects were previously contiguous and not mutated
     /// in a way that causes re-allocation i.e., if `other` was created by
     /// calling `split_off` on this `BytesMut`, then this is an `O(1)` operation
     /// that just decreases a reference count and sets a few indices.
+    /// The two views do not have to be exactly adjacent: they are also merged
+    /// when they are only separated by spare capacity of `self`, or when they
+    /// are the only remaining handles to the allocation, e.g. the views in
+    /// between were dropped after splitting several times. Any gap between
+    /// the two views is zero-filled and becomes part of the buffer.
+    ///
     /// Otherwise this method degenerates to
     /// `self.extend_from_slice(other.as_ref())`.
     ///
@@ -1061,8 +1068,17 @@ impl BytesMut {
     /// If the two `BytesMut` objects were previously contiguous, i.e., if
     /// `other` was created by calling `split_off` on this `BytesMut`, then
     /// this is an `O(1)` operation that just decreases a reference
-    /// count and sets a few indices. Otherwise this method returns an error
-    /// containing the original `other`.
+    /// count and sets a few indices.
+    ///
+    /// The two views do not have to be exactly adjacent. They can also be
+    /// merged when they are only separated by spare capacity of `self`, or
+    /// when `self` and `other` are the only remaining handles to the
+    /// allocation, e.g. the views in between were dropped after splitting
+    /// several times. Any gap between the two views is zero-filled and
+    /// becomes part of the buffer.
+    ///
+    /// Otherwise this method returns an error containing the original
+    /// `other`.
     ///
     /// # Examples
     ///
@@ -1089,19 +1105,46 @@ impl BytesMut {
             return Ok(());
         }
 
-        let ptr = unsafe { self.ptr.as_ptr().add(self.len) };
-        if ptr == other.ptr.as_ptr()
-            && self.kind() == KIND_ARC
-            && other.kind() == KIND_ARC
-            && self.data == other.data
-        {
-            // Contiguous blocks, just combine directly
-            self.len += other.len;
-            self.cap += other.cap;
-            Ok(())
-        } else {
-            Err(other)
+        if self.kind() == KIND_ARC && other.kind() == KIND_ARC && self.data == other.data {
+            // Both views point into the same allocation. `other` can be
+            // reabsorbed without copying when no handle besides `self` can
+            // observe the memory between the two views. This is the case
+            // when the gap lies within `self`'s own spare capacity (views
+            // sharing an allocation own disjoint capacity, so that memory
+            // belongs to `self` alone), or when `self` and `other` are the
+            // only two handles left referencing the allocation, e.g. the
+            // views in between were dropped after splitting several times.
+            let end = unsafe { self.ptr.as_ptr().add(self.len) };
+            let other_start = other.ptr.as_ptr();
+
+            if other_start >= end {
+                let cap_end = unsafe { self.ptr.as_ptr().add(self.cap) };
+                let gap = unsafe { other_start.offset_from(end) } as usize;
+
+                // When `self` is empty, a gap would turn into leading zero
+                // bytes, so only exactly adjacent views are merged;
+                // `unsplit` adopts `other` in that case instead.
+                let mergeable = gap == 0
+                    || (self.len > 0
+                        && (other_start <= cap_end
+                            || unsafe { (*self.data).ref_count.load(Ordering::Acquire) == 2 }));
+
+                if mergeable {
+                    // The gap may contain uninitialized bytes, so zero it
+                    // before exposing it as part of the initialized view.
+                    if gap > 0 {
+                        unsafe { ptr::write_bytes(end, 0, gap) };
+                    }
+
+                    let offset = unsafe { other_start.offset_from(self.ptr.as_ptr()) } as usize;
+                    self.len = offset + other.len;
+                    self.cap = offset + other.cap;
+                    return Ok(());
+                }
+            }
         }
+
+        Err(other)
     }
 
     #[inline]

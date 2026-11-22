@@ -983,6 +983,79 @@ fn bytes_mut_unsplit_two_split_offs() {
 }
 
 #[test]
+fn bytes_mut_unsplit_split_write_merge() {
+    // Split a buffer into two parts, write a short header into the first
+    // part and the payload into the second one, then merge them back into
+    // a single buffer without copying.
+    let mut buf = BytesMut::with_capacity(64);
+    let mut body = buf.split_off(16);
+
+    buf.extend_from_slice(b"head");
+    body.extend_from_slice(b"body");
+
+    buf.unsplit(body);
+
+    assert_eq!(buf.capacity(), 64);
+    assert_eq!(buf.len(), 20);
+    assert_eq!(&buf[..4], b"head");
+    assert_eq!(&buf[4..16], &[0u8; 12]);
+    assert_eq!(&buf[16..], b"body");
+}
+
+#[test]
+fn bytes_mut_try_unsplit_within_spare_capacity() {
+    let mut buf = BytesMut::with_capacity(64);
+    buf.extend_from_slice(b"aa");
+
+    // `other` begins where `buf`'s capacity ends; the spare capacity in
+    // between belongs to `buf` alone, so the two merge without copying.
+    let other = buf.split_off(8);
+
+    buf.try_unsplit(other).unwrap();
+
+    assert_eq!(buf.capacity(), 64);
+    assert_eq!(buf.len(), 8);
+    assert_eq!(&buf[..2], b"aa");
+    assert_eq!(&buf[2..], &[0u8; 6]);
+}
+
+#[test]
+fn bytes_mut_unsplit_after_dropping_intermediate_views() {
+    // Split several times and drop the views in between: the remaining
+    // parts still merge back into a single buffer without copying.
+    let mut buf = BytesMut::with_capacity(64);
+    buf.extend_from_slice(b"aaaabbbbccccdddd");
+
+    let mut mid = buf.split_off(8);
+    let tail = mid.split_off(4);
+    drop(mid);
+
+    buf.unsplit(tail);
+
+    assert_eq!(buf.capacity(), 64);
+    assert_eq!(&buf[..8], b"aaaabbbb");
+    assert_eq!(&buf[8..12], &[0u8; 4]);
+    assert_eq!(&buf[12..], b"dddd");
+}
+
+#[test]
+fn bytes_mut_try_unsplit_err_with_live_intermediate_view() {
+    // A view in between that is still alive prevents merging: the parts
+    // cannot be reabsorbed without invalidating it.
+    let mut buf = BytesMut::with_capacity(64);
+    buf.extend_from_slice(b"aaaabbbbccccdddd");
+
+    let mut mid = buf.split_off(8);
+    let tail = mid.split_off(4);
+
+    let tail = buf.try_unsplit(tail).unwrap_err();
+    mid.unsplit(tail);
+    buf.unsplit(mid);
+
+    assert_eq!(b"aaaabbbbccccdddd", &buf[..]);
+}
+
+#[test]
 fn from_iter_no_size_hint() {
     use std::iter;
 
