@@ -1,3 +1,12 @@
+# Unreleased
+
+### Added
+- Add `BytesMut::share`, which creates an overlapping zero-copy view over the
+  same bytes. Shared views use copy-on-write, so the first mutation detaches
+  only that view's visible bytes into a private allocation. A shared view can
+  be frozen into an immutable `Bytes` snapshot while the original buffer keeps
+  being written.
+
 # 1.12.2 (November 17th, 2026)
 
 ### Fixed
